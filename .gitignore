@@ -3,8 +3,7 @@ __pycache__/
 *.pyc
 
 data/
-models/
-outputs/
+
 
 .DS_Store
 Thumb.db
