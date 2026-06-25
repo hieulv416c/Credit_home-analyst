@@ -42,8 +42,7 @@ def load_raw_data(is_train: bool = True) -> pd.DataFrame:
         
     print(f"    Kích thước dữ liệu {mode} sau tiền xử lý nền: {df.shape[0]} dòng, {df.shape[1]} cột.")
     return df
-
-
+ 
 def optimize_memory(df: pd.DataFrame) -> pd.DataFrame:
     """
     Tối ưu dung lượng RAM an toàn mà KHÔNG tự ý điền khuyết (fillna).

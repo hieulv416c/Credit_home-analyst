@@ -1,174 +1,319 @@
 from __future__ import annotations
+
 import pandas as pd
-import numpy as np
+
 from . import config as C
 
-def check_data_health(df: pd.DataFrame, is_train: bool = True) -> dict[str, list[str]]:
-    """
-    Hệ thống tầm soát sức khỏe dữ liệu hợp nhất (Bác sĩ trưởng khoa).
-    Quét từ cấu trúc hệ thống, nhân khẩu học cho đến logic tài chính chuyên sâu.
-    """
-    # Khởi tạo bệnh án tập trung
-    medical_report = {
-        "CRITICAL_ERRORS": [],     # Lỗi hệ thống, trùng lặp, thiếu cột hoặc sai nhãn
-        "LOGIC_VIOLATIONS": [],    # Lỗi mâu thuẫn logic kinh doanh/toán học tài chính
-        "DATA_QUALITY_NOTES": []   # Ghi chú về missing value cao hoặc điểm cần lưu ý
+
+Report = dict[str, list[str]]
+
+
+def _new_report() -> Report:
+    return {
+        "CRITICAL_ERRORS": [],
+        "LOGIC_VIOLATIONS": [],
+        "DATA_QUALITY_NOTES": [],
     }
-    
-    # -------------------------------------------------------------------------
-    # 1. KIỂM TRA CẤU TRÚC & ĐỊNH DẠNG CỘT (Schema Validation)
-    # -------------------------------------------------------------------------
+
+
+def _target_columns() -> list[str]:
+    targets = getattr(C, "TARGET_COLS", {})
+    if isinstance(targets, dict):
+        return list(targets.values())
+    return list(targets)
+
+
+def _configured_feature_columns() -> set[str]:
+    """Lay danh sach feature tu schema hien tai trong config.py."""
+    feature_cols: set[str] = set()
+
+    for attr in (
+        "NUMERICAL_FEATURES",
+        "CATEGORICAL_FEATURES",
+        "ORDINAL_NUMERIC_FEATURES",
+        "ORDINAL_STRING_FEATURES",
+        "FLAG_FEATURES",
+    ):
+        feature_cols.update(getattr(C, attr, []))
+
+    for cols in getattr(C, "FEATURE_GROUPS", {}).values():
+        feature_cols.update(cols)
+
+    non_features = set(getattr(C, "NON_FEATURE_COLS", []))
+    return feature_cols - non_features
+
+
+def _valid_treatments() -> set[str]:
+    return {
+        str(getattr(C, "TREAT_CASH", "cash")).strip().lower(),
+        str(getattr(C, "TREAT_CARD", "card")).strip().lower(),
+    }
+
+
+def _to_numeric(df: pd.DataFrame, col: str) -> pd.Series:
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def check_data_health(df: pd.DataFrame, is_train: bool = True) -> Report:
+    """
+    Kiem tra suc khoe du lieu: schema, treatment, target, missing va logic nghiep vu.
+
+    Ham nay chi bao cao loi, khong mutate dataframe dau vao.
+    """
+    report = _new_report()
+
     current_cols = set(df.columns)
-    base_features = set(C.FLAG_FEATURES) 
-    if hasattr(C, 'REAL_FEATURES'): base_features |= set(C.REAL_FEATURES)
-    if hasattr(C, 'NUM_FEATURES'):  base_features |= set(C.NUM_FEATURES)
-    if hasattr(C, 'CAT_FEATURES'):  base_features |= set(C.CAT_FEATURES)
-    expected_features = base_features | {C.ID_COL, C.TREATMENT_COL}
+
+    # Cot bat buoc de pipeline chay duoc.
+    required_cols = {C.ID_COL, C.TREATMENT_COL}
     if is_train:
-        expected_features |= set(C.TARGET_COLS.values())
-        
-    missing_cols = expected_features - current_cols
-    if missing_cols:
-        medical_report["CRITICAL_ERRORS"].append(f"Thiếu các cột bắt buộc trong file: {missing_cols}")
-        return medical_report # Dừng lại ngay vì không đủ cột để kiểm tra các bước sau
+        required_cols.update(_target_columns())
 
-    # -------------------------------------------------------------------------
-    # 2. KIỂM TRA SƠ BỘ: TRÙNG LẶP ID & CỘT RỖNG 100%
-    # -------------------------------------------------------------------------
-    # Kiểm tra trùng lặp ID
-    dup_count = df[C.ID_COL].duplicated().sum()
+    missing_required = sorted(required_cols - current_cols)
+    if missing_required:
+        report["CRITICAL_ERRORS"].append(
+            f"Thieu cac cot bat buoc trong file: {missing_required}"
+        )
+        return report
+
+    # Feature thieu trong config la canh bao schema, khong nen dung toan bo validation.
+    missing_config_features = sorted(_configured_feature_columns() - current_cols)
+    if missing_config_features:
+        report["DATA_QUALITY_NOTES"].append(
+            f"Config co {len(missing_config_features)} feature khong co trong file: {missing_config_features}"
+        )
+
+    _validate_ids(df, report)
+    _validate_missingness(df, report, is_train=is_train)
+    _validate_treatment_labels(df, report)
+    _validate_targets(df, report, is_train=is_train)
+    _validate_basic_ranges(df, report)
+    _validate_financial_logic(df, report)
+
+    return report
+
+
+def _validate_ids(df: pd.DataFrame, report: Report) -> None:
+    missing_ids = int(df[C.ID_COL].isna().sum())
+    if missing_ids > 0:
+        report["CRITICAL_ERRORS"].append(
+            f"Cot {C.ID_COL} co {missing_ids} dong bi thieu ID."
+        )
+
+    dup_count = int(df[C.ID_COL].duplicated().sum())
     if dup_count > 0:
-        medical_report["CRITICAL_ERRORS"].append(f"Phát hiện {dup_count} dòng bị trùng lặp ID khách hàng ({C.ID_COL})!")
+        report["CRITICAL_ERRORS"].append(
+            f"Phat hien {dup_count} dong bi trung lap ID khach hang ({C.ID_COL})."
+        )
 
-    # Kiểm tra cột rỗng hoàn toàn hoặc khuyết quá cao
+
+def _validate_missingness(df: pd.DataFrame, report: Report, is_train: bool) -> None:
+    optional_test_targets = set() if is_train else set(_target_columns())
+    high_missing_allowed = set(getattr(C, "HIGH_MISSING_COLS", []))
+
     for col in df.columns:
-        missing_pct = df[col].isnull().mean()
-        if missing_pct == 1.0:
-            medical_report["CRITICAL_ERRORS"].append(f"Cột [{col}] bị rỗng hoàn toàn 100%. Cần gỡ bỏ!")
-        elif missing_pct > 0.8 and col not in ["ratio_monthly_amt_l6m_vs_n6m", "ratio_vol_hcvn_cash_appl_12m"]:
-            # Né 2 cột đặc biệt ở Group 5 ra để tí xử lý riêng ở hàm logic
-            medical_report["DATA_QUALITY_NOTES"].append(f"Cột [{col}] có tỷ lệ khuyết rất cao ({missing_pct*100:.2f}%).")
+        missing_pct = float(df[col].isna().mean())
 
-    # -------------------------------------------------------------------------
-    # 3. KIỂM TRA NHÂN KHẨU HỌC & NHÃN CHIẾN DỊCH
-    # -------------------------------------------------------------------------
-    # Kiểm tra Tuổi (cli_age)
-    if "cli_age" in df.columns:
-        invalid_age = df[(df["cli_age"] < 18) | (df["cli_age"] > 100)]
-        if len(invalid_age) > 0:
-            medical_report["LOGIC_VIOLATIONS"].append(f"Nhân khẩu học: Có {len(invalid_age)} dòng có tuổi bất hợp lý (<18 hoặc >100).")
-
-    # Kiểm tra tính hợp lệ của nhãn Treatment
-    if C.TREATMENT_COL in df.columns:
-        invalid_treatments = df[~df[C.TREATMENT_COL].isin(["Cash", "Card"])]
-        if len(invalid_treatments) > 0:
-            medical_report["CRITICAL_ERRORS"].append(f"Cột treatment chứa nhãn lạ ngoài 'Cash'/'Card': {invalid_treatments[C.TREATMENT_COL].unique()}")
-
-    # -------------------------------------------------------------------------
-    # 4. GỌI BỘ KIỂM TRA LOGIC TÀI CHÍNH CHUYÊN SÂU
-    # -------------------------------------------------------------------------
-    medical_report = _validate_financial_logic(df, medical_report)
-
-    return medical_report
-
-
-def _validate_financial_logic(df: pd.DataFrame, medical_report: dict[str, list[str]]) -> dict[str, list[str]]:
-    """
-    Hàm nội bộ (Private Helper): Quét 5 nhóm logic nghiệp vụ tài chính chuyên sâu.
-    """
-    # GROUP 1: Nhóm Logic về Thời gian và Lịch sử Giao dịch
-    if "f_ever_default" in df.columns and "cnt_month_status1" in df.columns:
-        cond_default = (df["f_ever_default"] == 1) & (df["cnt_month_status1"] == 0)
-        if cond_default.sum() > 0:
-            medical_report["LOGIC_VIOLATIONS"].append(
-                f"Gãy Group 1.1: Có {cond_default.sum()} dòng ghi nhận 'Từng nợ xấu' (f_ever_default=1) nhưng số tháng trạng thái xấu nhất lại bằng 0!"
-            )
-            
-    if all(c in df.columns for c in ["cnt_month_from_first_transaction", "cnt_total_payment"]):
-        cond_timeline = df["cnt_month_from_first_transaction"].isna() & (df["cnt_total_payment"] > 0)
-        if cond_timeline.sum() > 0:
-            medical_report["LOGIC_VIOLATIONS"].append(
-                f"Gãy Group 1.2: Có {cond_timeline.sum()} dòng chưa từng có giao dịch (Tháng rỗng) nhưng số lần thanh toán lại > 0!"
-            )
-
-    # GROUP 2: Nhóm Logic về Hành vi Cuộc gọi (Telesales)
-    if all(c in df.columns for c in ["cnt_connected_tls", "cnt_fail_tls_3m"]):
-        cond_call = (df["cnt_connected_tls"] == 0) & (df["cnt_fail_tls_3m"].fillna(0) == 0)
-        if cond_call.sum() > 0:
-            medical_report["LOGIC_VIOLATIONS"].append(
-                f"Gãy Group 2: Có {cond_call.sum()} khách hàng có cả cuộc gọi thành công và thất bại đều bằng 0/NaN."
-            )
-
-    # GROUP 3: Nhóm Logic về Hạn mức và Số tiền (Volume & Limit)
-    if "min_sign_vol" in df.columns and "avg_sign_vol" in df.columns:
-        cond_vol = df["min_sign_vol"] > df["avg_sign_vol"]
-        if cond_vol.sum() > 0:
-            medical_report["LOGIC_VIOLATIONS"].append(
-                f"Gãy Group 3.1: Có {cond_vol.sum()} dòng có số tiền vay nhỏ nhất (min_sign_vol) LỚN HƠN số tiền vay trung bình!"
-            )
-            
-    money_cols = ["min_sign_vol", "avg_sign_vol", "last_offer_limit", "amt_terminated_loan_12m"]
-    for col in money_cols:
-        if col in df.columns:
-            neg_count = (df[col] < 0).sum()
-            if neg_count > 0:
-                medical_report["LOGIC_VIOLATIONS"].append(f"Gãy Group 3.1 (Số âm): Cột số tiền [{col}] chứa {neg_count} dòng giá trị âm.")
-            
-    if "f_approve_last_process" in df.columns and "last_offer_limit" in df.columns:
-        cond_reject_limit = (df["f_approve_last_process"] == 0) & (df["last_offer_limit"] > 0)
-        if cond_reject_limit.sum() > 0:
-            medical_report["DATA_QUALITY_NOTES"].append(
-                f"Lưu ý Group 3.2: Có {cond_reject_limit.sum()} dòng bị TỪ CHỐI đơn gần nhất nhưng vẫn có hạn mức offer > 0 (Có thể là Pre-approved)."
-            )
-
-    # GROUP 4: Nhóm Logic về CIC
-    if all(c in df.columns for c in ["cnt_bank_inst_appl_12m", "cnt_fi_inst_appl_12m", "cnt_lender_has2pay_last_24m"]):
-        total_appl_12m = df["cnt_bank_inst_appl_12m"].fillna(0) + df["cnt_fi_inst_appl_12m"].fillna(0)
-        cond_cic = df["cnt_lender_has2pay_last_24m"] > total_appl_12m
-        if cond_cic.sum() > 0:
-            medical_report["DATA_QUALITY_NOTES"].append(
-                f"Lưu ý Group 4: Có {cond_cic.sum()} khách hàng có số tổ chức đang trả nợ (24m) vượt quá số tổ chức nộp đơn (12m)."
-            )
-
-    # GROUP 5: Cảnh báo đặc biệt về Tỷ lệ Missing dữ liệu (Mẫu số bằng 0)
-    for col in ["ratio_monthly_amt_l6m_vs_n6m", "ratio_vol_hcvn_cash_appl_12m"]:
-        if col in df.columns:
-            missing_pct = df[col].isnull().mean() * 100
-            if missing_pct > 80:
-                medical_report["DATA_QUALITY_NOTES"].append(
-                    f"Cảnh báo Group 5: Cột [{col}] khuyết rất cao ({missing_pct:.2f}%). Do mẫu số bằng 0 (Sẽ xử lý ở bước sau)."
+        if col in optional_test_targets:
+            if missing_pct == 1.0:
+                report["DATA_QUALITY_NOTES"].append(
+                    f"Cot [{col}] trong tap test rong 100%; neu day la file scoring thi hop le."
                 )
+            continue
 
-    return medical_report
+        if missing_pct == 1.0:
+            report["CRITICAL_ERRORS"].append(
+                f"Cot [{col}] bi rong hoan toan 100%. Can kiem tra lai nguon du lieu."
+            )
+        elif missing_pct > 0.8 and col not in high_missing_allowed:
+            report["DATA_QUALITY_NOTES"].append(
+                f"Cot [{col}] co ty le khuyet rat cao ({missing_pct * 100:.2f}%)."
+            )
 
 
-def print_health_report(report: dict[str, list[str]], title: str = "TRAIN") -> bool:
-    """
-    In báo cáo bệnh án sạch đẹp ra màn hình Notebook.
-    """
-    print(f"\n================ BÁO CÁO TẦM SOÁT SỨC KHỎE TẬP [{title.upper()}] ================")
-    
+def _validate_treatment_labels(df: pd.DataFrame, report: Report) -> None:
+    treatment_norm = df[C.TREATMENT_COL].astype("string").str.strip().str.lower()
+    invalid_mask = treatment_norm.isna() | ~treatment_norm.isin(_valid_treatments())
+    invalid_count = int(invalid_mask.fillna(False).sum())
+
+    if invalid_count > 0:
+        invalid_values = (
+            df.loc[invalid_mask, C.TREATMENT_COL]
+            .drop_duplicates()
+            .head(10)
+            .astype(str)
+            .tolist()
+        )
+        report["CRITICAL_ERRORS"].append(
+            f"Cot treatment co {invalid_count} dong nhan la/khuyet. Vi du: {invalid_values}"
+        )
+
+
+def _validate_targets(df: pd.DataFrame, report: Report, is_train: bool) -> None:
+    if not is_train:
+        return
+
+    for col in _target_columns():
+        y = _to_numeric(df, col)
+
+        missing = int(y.isna().sum())
+        if missing > 0:
+            report["CRITICAL_ERRORS"].append(
+                f"Cot target [{col}] co {missing} dong bi khuyet trong tap train."
+            )
+
+        invalid_mask = y.notna() & ~y.isin([0, 1])
+        invalid_count = int(invalid_mask.sum())
+        if invalid_count > 0:
+            report["CRITICAL_ERRORS"].append(
+                f"Cot target [{col}] co {invalid_count} gia tri khac 0/1."
+            )
+
+
+def _validate_basic_ranges(df: pd.DataFrame, report: Report) -> None:
+    if "cli_age" in df.columns:
+        age = _to_numeric(df, "cli_age")
+        invalid_age = age.notna() & ((age < 18) | (age > 100))
+        n_invalid = int(invalid_age.sum())
+        if n_invalid > 0:
+            report["LOGIC_VIOLATIONS"].append(
+                f"Nhan khau hoc: Co {n_invalid} dong co tuoi bat hop ly (<18 hoac >100)."
+            )
+
+    for col in getattr(C, "FLAG_FEATURES", []):
+        if col not in df.columns:
+            continue
+
+        values = _to_numeric(df, col)
+        invalid_mask = values.notna() & ~values.isin([0, 1])
+        invalid_count = int(invalid_mask.sum())
+        if invalid_count > 0:
+            report["LOGIC_VIOLATIONS"].append(
+                f"Cot co [{col}] co {invalid_count} gia tri khac 0/1."
+            )
+
+
+def _validate_financial_logic(df: pd.DataFrame, report: Report) -> None:
+    """Quet cac nhom logic nghiep vu tai chinh chinh."""
+    if {"f_ever_default", "cnt_month_status1"}.issubset(df.columns):
+        ever_default = _to_numeric(df, "f_ever_default")
+        status1_months = _to_numeric(df, "cnt_month_status1")
+        cond_default = (ever_default == 1) & (status1_months == 0)
+        n = int(cond_default.sum())
+        if n > 0:
+            report["LOGIC_VIOLATIONS"].append(
+                f"Group 1.1: Co {n} dong f_ever_default=1 nhung cnt_month_status1=0."
+            )
+
+    if {"cnt_month_from_first_transaction", "cnt_total_payment"}.issubset(df.columns):
+        first_txn_months = _to_numeric(df, "cnt_month_from_first_transaction")
+        total_payment = _to_numeric(df, "cnt_total_payment")
+        cond_timeline = first_txn_months.isna() & (total_payment > 0)
+        n = int(cond_timeline.sum())
+        if n > 0:
+            report["LOGIC_VIOLATIONS"].append(
+                f"Group 1.2: Co {n} dong chua co thang giao dich dau tien nhung cnt_total_payment > 0."
+            )
+
+    if {"cnt_connected_tls", "cnt_fail_tls_3m"}.issubset(df.columns):
+        connected = _to_numeric(df, "cnt_connected_tls")
+        failed_3m = _to_numeric(df, "cnt_fail_tls_3m")
+        cond_call = (connected == 0) & (failed_3m.fillna(0) == 0)
+        n = int(cond_call.sum())
+        if n > 0:
+            report["LOGIC_VIOLATIONS"].append(
+                f"Group 2: Co {n} khach hang co ca so cuoc goi thanh cong va that bai bang 0/NaN."
+            )
+
+    if {"min_sign_vol", "avg_sign_vol"}.issubset(df.columns):
+        min_sign = _to_numeric(df, "min_sign_vol")
+        avg_sign = _to_numeric(df, "avg_sign_vol")
+        cond_vol = min_sign > avg_sign
+        n = int(cond_vol.sum())
+        if n > 0:
+            report["LOGIC_VIOLATIONS"].append(
+                f"Group 3.1: Co {n} dong min_sign_vol lon hon avg_sign_vol."
+            )
+
+    money_cols = [
+        "min_sign_vol",
+        "avg_sign_vol",
+        "max_sign_vol",
+        "last_offer_limit",
+        "amt_terminated_loan_12m",
+    ]
+    for col in money_cols:
+        if col not in df.columns:
+            continue
+
+        neg_count = int((_to_numeric(df, col) < 0).sum())
+        if neg_count > 0:
+            report["LOGIC_VIOLATIONS"].append(
+                f"Group 3.1: Cot tien [{col}] co {neg_count} dong gia tri am."
+            )
+
+    if {"f_approve_last_process", "last_offer_limit"}.issubset(df.columns):
+        approved = _to_numeric(df, "f_approve_last_process")
+        offer_limit = _to_numeric(df, "last_offer_limit")
+        cond_reject_limit = (approved == 0) & (offer_limit > 0)
+        n = int(cond_reject_limit.sum())
+        if n > 0:
+            report["DATA_QUALITY_NOTES"].append(
+                f"Group 3.2: Co {n} dong bi reject lan gan nhat nhung van co last_offer_limit > 0."
+            )
+
+    if {
+        "cnt_bank_inst_appl_12m",
+        "cnt_fi_inst_appl_12m",
+        "cnt_lender_has2pay_last_24m",
+    }.issubset(df.columns):
+        bank_appl = _to_numeric(df, "cnt_bank_inst_appl_12m").fillna(0)
+        fi_appl = _to_numeric(df, "cnt_fi_inst_appl_12m").fillna(0)
+        lenders_24m = _to_numeric(df, "cnt_lender_has2pay_last_24m")
+        total_appl_12m = bank_appl + fi_appl
+        cond_cic = lenders_24m > total_appl_12m
+        n = int(cond_cic.sum())
+        if n > 0:
+            report["DATA_QUALITY_NOTES"].append(
+                f"Group 4: Co {n} khach hang co so to chuc dang tra no 24m vuot so to chuc nop don 12m."
+            )
+
+    for col in getattr(C, "HIGH_MISSING_COLS", []):
+        if col not in df.columns:
+            continue
+
+        missing_pct = float(df[col].isna().mean()) * 100
+        if missing_pct > 80:
+            report["DATA_QUALITY_NOTES"].append(
+                f"Group 5: Cot [{col}] khuyet rat cao ({missing_pct:.2f}%). Can xu ly bang missing flag/imputation."
+            )
+
+
+def print_health_report(report: Report, title: str = "TRAIN") -> bool:
+    """In bao cao validation va tra ve True neu khong co critical/logic violation."""
+    print(f"\n================ BAO CAO TAM SOAT SUC KHOE TAP [{title.upper()}] ================")
+
     has_critical = len(report["CRITICAL_ERRORS"]) > 0
     has_violations = len(report["LOGIC_VIOLATIONS"]) > 0
-    
-    # 1. Lỗi nghiêm trọng
+
     if has_critical:
-        print("\n LỖI NGHIÊM TRỌNG TRÊN HỆ THỐNG (Cần xử lý ngay):")
-        for err in report["CRITICAL_ERRORS"]: print(f"  - {err}")
+        print("\nLOI NGHIEM TRONG:")
+        for err in report["CRITICAL_ERRORS"]:
+            print(f"  - {err}")
     else:
-        print("\n Cấu trúc file & Hệ thống: OK")
+        print("\nCau truc file va he thong: OK")
 
-    # 2. Vi phạm logic nghiệp vụ
     if has_violations:
-        print("\n VI PHẠM LOGIC NGHIỆP VỤ & TOÁN HỌC TÀI CHÍNH:")
-        for viol in report["LOGIC_VIOLATIONS"]: print(f"  - {viol}")
+        print("\nVI PHAM LOGIC NGHIEP VU:")
+        for violation in report["LOGIC_VIOLATIONS"]:
+            print(f"  - {violation}")
     else:
-        print(" Logic nghiệp vụ & Toán học: OK")
+        print("Logic nghiep vu va toan hoc: OK")
 
-    # 3. Ghi chú chất lượng
     if report["DATA_QUALITY_NOTES"]:
-        print("\n GHI CHÚ CHẤT LƯỢNG DỮ LIỆU & PHÉP CHIA CHO 0:")
-        for note in report["DATA_QUALITY_NOTES"]: print(f"  - {note}")
-        
+        print("\nGHI CHU CHAT LUONG DU LIEU:")
+        for note in report["DATA_QUALITY_NOTES"]:
+            print(f"  - {note}")
+
     print("\n=====================================================================\n")
     return not (has_critical or has_violations)
